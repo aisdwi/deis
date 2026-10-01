@@ -1,0 +1,297 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(pocketId) {
+      return signedIn()
+        && get(/databases/$(database)/documents/pockets/$(pocketId)).data.ownerId == request.auth.uid;
+    }
+
+    function isFamilyPocket(pocketId) {
+      return get(/databases/$(database)/documents/pockets/$(pocketId)).data.type == "family";
+    }
+
+    function isMember(pocketId) {
+      return signedIn()
+        && get(/databases/$(database)/documents/pocketMembers/$(pocketId + "_" + request.auth.uid)).data.userId == request.auth.uid
+        && get(/databases/$(database)/documents/pocketMembers/$(pocketId + "_" + request.auth.uid)).data.pocketId == pocketId
+        && get(/databases/$(database)/documents/pocketMembers/$(pocketId + "_" + request.auth.uid)).data.role in ["owner", "member", "viewer"];
+    }
+
+    function isPocketMemberWriter(pocketId) {
+      return isMember(pocketId)
+        && get(/databases/$(database)/documents/pocketMembers/$(pocketId + "_" + request.auth.uid)).data.role == "member";
+    }
+
+    function isBudgetWriter(pocketId) {
+      return isOwner(pocketId) || isPocketMemberWriter(pocketId);
+    }
+
+    function isValidBudget(data) {
+      return data is map
+        && data.keys().hasAll(["pocketId", "month", "category", "amount", "createdBy", "createdAt", "updatedAt"])
+        && data.keys().hasOnly(["pocketId", "month", "category", "amount", "createdBy", "createdAt", "updatedAt"])
+        && data.pocketId is string
+        && data.pocketId.size() > 0
+        && data.pocketId.size() <= 128
+        && data.month is string
+        && data.month.matches("^[0-9]{4}-(0[1-9]|1[0-2])$")
+        && data.category is string
+        && data.category.size() > 0
+        && data.category.size() <= 60
+        && data.amount is int
+        && data.amount > 0
+        && data.amount <= 1000000000000
+        && data.createdBy is string
+        && data.createdBy.size() > 0
+        && data.createdBy.size() <= 128
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    match /users/{userId} {
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasAll(["name", "email", "createdAt"])
+        && request.resource.data.keys().hasOnly(["name", "email", "createdAt"])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 100
+        && request.resource.data.email is string
+        && request.resource.data.email.size() <= 254
+        && request.resource.data.createdAt is timestamp;
+
+      allow get: if signedIn() && request.auth.uid == userId;
+      allow list: if false;
+
+      allow update: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["name", "updatedAt"])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 100;
+
+      // Account/profile deletion needs a coordinated cleanup flow.
+      allow delete: if false;
+    }
+
+    match /pockets/{pocketId} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasAll(["name", "type", "ownerId", "createdAt"])
+        && request.resource.data.keys().hasOnly(["name", "type", "ownerId", "createdAt"])
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.type in ["personal", "family"]
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 80
+        && request.resource.data.createdAt is timestamp;
+
+      allow get, list: if signedIn()
+        && (resource.data.ownerId == request.auth.uid || isMember(pocketId));
+
+      allow update: if signedIn()
+        && resource.data.ownerId == request.auth.uid
+        && request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.type == resource.data.type
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["name", "updatedAt"])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 80;
+
+      // Only the family pocket owner can delete a family pocket.
+      allow delete: if signedIn()
+        && resource.data.ownerId == request.auth.uid
+        && resource.data.type == "family";
+    }
+
+    match /pocketMembers/{memberId} {
+      // Pocket owners may create only their own owner membership.
+      allow create: if signedIn()
+        && isOwner(request.resource.data.pocketId)
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.role == "owner"
+        && request.resource.data.keys().hasAll(["pocketId", "userId", "role", "joinedAt"])
+        && request.resource.data.keys().hasOnly(["pocketId", "userId", "displayName", "role", "joinedAt"])
+        && request.resource.data.joinedAt is timestamp;
+
+      // A recipient can create their own membership only from a valid pending family invite.
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid
+        && memberId == request.resource.data.pocketId + "_" + request.auth.uid
+        && request.resource.data.role in ["member", "viewer"]
+        && request.resource.data.keys().hasAll(["pocketId", "userId", "displayName", "role", "inviteId", "joinedAt"])
+        && request.resource.data.keys().hasOnly(["pocketId", "userId", "displayName", "role", "inviteId", "joinedAt"])
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() <= 100
+        && request.resource.data.joinedAt is timestamp
+        && isFamilyPocket(request.resource.data.pocketId)
+        && exists(/databases/$(database)/documents/familyInvites/$(request.resource.data.inviteId))
+        && get(/databases/$(database)/documents/familyInvites/$(request.resource.data.inviteId)).data.pocketId == request.resource.data.pocketId
+        && get(/databases/$(database)/documents/familyInvites/$(request.resource.data.inviteId)).data.email == request.auth.token.email
+        && get(/databases/$(database)/documents/familyInvites/$(request.resource.data.inviteId)).data.status == "pending"
+        && get(/databases/$(database)/documents/familyInvites/$(request.resource.data.inviteId)).data.role == request.resource.data.role;
+
+      allow get, list: if signedIn()
+        && (
+          resource.data.userId == request.auth.uid
+          || isOwner(resource.data.pocketId)
+          || isMember(resource.data.pocketId)
+        );
+
+      // No role-management UI exists yet; keep membership identity and role immutable.
+      allow update: if false;
+
+      // Owners can remove every membership when deleting their family pocket.
+      allow delete: if signedIn()
+        && isOwner(resource.data.pocketId);
+    }
+
+    match /familyInvites/{inviteId} {
+      allow create: if signedIn()
+        && isOwner(request.resource.data.pocketId)
+        && isFamilyPocket(request.resource.data.pocketId)
+        && request.resource.data.invitedBy == request.auth.uid
+        && request.resource.data.role in ["member", "viewer"]
+        && request.resource.data.status == "pending"
+        && request.resource.data.keys().hasAll(["pocketId", "email", "invitedBy", "role", "status", "createdAt"])
+        && request.resource.data.keys().hasOnly(["pocketId", "email", "invitedBy", "role", "status", "createdAt"])
+        && request.resource.data.email is string
+        && request.resource.data.email.size() > 0
+        && request.resource.data.email.size() <= 254
+        && request.resource.data.createdAt is timestamp;
+
+      allow get: if signedIn()
+        && (
+          resource.data.email == request.auth.token.email
+          || isOwner(resource.data.pocketId)
+        );
+
+      // Owners need to list invites filtered by pocketId during pocket cleanup.
+      allow list: if signedIn()
+        && (
+          resource.data.email == request.auth.token.email
+          || isOwner(resource.data.pocketId)
+        );
+
+      // Recipients can only change status.
+      allow update: if signedIn()
+        && resource.data.email == request.auth.token.email
+        && resource.data.status == "pending"
+        && request.resource.data.pocketId == resource.data.pocketId
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.invitedBy == resource.data.invitedBy
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status"])
+        && request.resource.data.status in ["accepted", "declined"]
+        && (
+          request.resource.data.status == "declined"
+          || (
+            isFamilyPocket(resource.data.pocketId)
+            && getAfter(/databases/$(database)/documents/pocketMembers/$(resource.data.pocketId + "_" + request.auth.uid)).data.userId == request.auth.uid
+            && getAfter(/databases/$(database)/documents/pocketMembers/$(resource.data.pocketId + "_" + request.auth.uid)).data.pocketId == resource.data.pocketId
+            && getAfter(/databases/$(database)/documents/pocketMembers/$(resource.data.pocketId + "_" + request.auth.uid)).data.role == resource.data.role
+            && getAfter(/databases/$(database)/documents/pocketMembers/$(resource.data.pocketId + "_" + request.auth.uid)).data.inviteId == inviteId
+          )
+        );
+
+      // Owners can remove pending or historical invites during pocket cleanup.
+      allow delete: if signedIn()
+        && isOwner(resource.data.pocketId);
+    }
+
+    match /transactions/{transactionId} {
+      allow get, list: if signedIn()
+        && (isOwner(resource.data.pocketId) || isMember(resource.data.pocketId));
+
+      allow create: if signedIn()
+        && (
+          isOwner(request.resource.data.pocketId)
+          || isPocketMemberWriter(request.resource.data.pocketId)
+        )
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.type in ["income", "expense"]
+        && request.resource.data.amount is int
+        && request.resource.data.amount > 0
+        && request.resource.data.category is string
+        && request.resource.data.category.size() > 0
+        && request.resource.data.category.size() <= 60
+        && request.resource.data.wallet is string
+        && request.resource.data.wallet.size() > 0
+        && request.resource.data.wallet.size() <= 50
+        && request.resource.data.date is string
+        && request.resource.data.date.matches("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+        && request.resource.data.description is string
+        && request.resource.data.description.size() <= 200
+        && request.resource.data.createdAt is timestamp
+        && request.resource.data.updatedAt is timestamp
+        && request.resource.data.keys().hasAll(["pocketId", "type", "amount", "category", "wallet", "date", "description", "createdBy", "createdAt", "updatedAt"])
+        && request.resource.data.keys().hasOnly(["pocketId", "type", "amount", "category", "wallet", "date", "description", "createdBy", "createdAt", "updatedAt"]);
+
+      allow update: if signedIn()
+        && request.resource.data.pocketId == resource.data.pocketId
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["type", "amount", "category", "wallet", "date", "description", "updatedAt"])
+        && request.resource.data.type in ["income", "expense"]
+        && request.resource.data.amount is int
+        && request.resource.data.amount > 0
+        && request.resource.data.category is string
+        && request.resource.data.category.size() > 0
+        && request.resource.data.category.size() <= 60
+        && request.resource.data.wallet is string
+        && request.resource.data.wallet.size() > 0
+        && request.resource.data.wallet.size() <= 50
+        && request.resource.data.date is string
+        && request.resource.data.date.matches("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+        && request.resource.data.description is string
+        && request.resource.data.description.size() <= 200
+        && request.resource.data.updatedAt is timestamp
+        && (
+          isOwner(resource.data.pocketId)
+          || (
+            isPocketMemberWriter(resource.data.pocketId)
+            && resource.data.createdBy == request.auth.uid
+          )
+        );
+
+      allow delete: if signedIn()
+        && (
+          isOwner(resource.data.pocketId)
+          || (
+            isPocketMemberWriter(resource.data.pocketId)
+            && resource.data.createdBy == request.auth.uid
+          )
+        );
+    }
+
+    match /budgets/{budgetId} {
+      // Pocket members can see budgets; viewers cannot change them.
+      allow get, list: if signedIn()
+        && (isOwner(resource.data.pocketId) || isMember(resource.data.pocketId));
+
+      allow create: if signedIn()
+        && isValidBudget(request.resource.data)
+        && budgetId == request.resource.data.pocketId + "_" + request.resource.data.month + "_" + request.resource.data.category
+        && isBudgetWriter(request.resource.data.pocketId)
+        && request.resource.data.createdBy == request.auth.uid;
+
+      allow update: if signedIn()
+        && isValidBudget(request.resource.data)
+        && isBudgetWriter(resource.data.pocketId)
+        && request.resource.data.pocketId == resource.data.pocketId
+        && request.resource.data.month == resource.data.month
+        && request.resource.data.category == resource.data.category
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["amount", "updatedAt"]);
+
+      allow delete: if signedIn() && isBudgetWriter(resource.data.pocketId);
+    }
+  }
+}
